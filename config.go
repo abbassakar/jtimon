@@ -1,15 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
+	"os/exec"
 	"reflect"
-	"sync"
-	"syscall"
 )
 
 // ConfigFileList to get the list of config file names
@@ -19,19 +19,33 @@ type ConfigFileList struct {
 
 // Config struct
 type Config struct {
-	Port     int           `json:"port"`
-	Host     string        `json:"host"`
-	User     string        `json:"user"`
-	Password string        `json:"password"`
-	CID      string        `json:"cid"`
-	Meta     bool          `json:"meta"`
-	EOS      bool          `json:"eos"`
-	API      APIConfig     `json:"api"`
-	GRPC     GRPCConfig    `json:"grpc"`
-	TLS      TLSConfig     `json:"tls"`
-	Influx   InfluxConfig  `json:"influx"`
-	Paths    []PathsConfig `json:"paths"`
-	Log      LogConfig     `json:"log"`
+	Port            int           `json:"port"`
+	Host            string        `json:"host"`
+	User            string        `json:"user"`
+	Password        string        `json:"password"`
+	CID             string        `json:"cid"`
+	Meta            bool          `json:"meta"`
+	EOS             bool          `json:"eos"`
+	GRPC            GRPCConfig    `json:"grpc"`
+	TLS             TLSConfig     `json:"tls"`
+	Influx          InfluxConfig  `json:"influx"`
+	Paths           []PathsConfig `json:"paths"`
+	Log             LogConfig     `json:"log"`
+	Vendor          VendorConfig  `json:"vendor"`
+	Alias           string        `json:"alias"`
+	PasswordDecoder string        `json:"password-decoder"`
+}
+
+// VendorConfig definition
+type VendorConfig struct {
+	Name     string         `json:"name"`
+	RemoveNS bool           `json:"remove-namespace"`
+	Schema   []VendorSchema `json:"schema"`
+}
+
+// VendorSchema definition
+type VendorSchema struct {
+	Path string `json:"path"`
 }
 
 //LogConfig is config struct for logging
@@ -39,11 +53,8 @@ type LogConfig struct {
 	File          string `json:"file"`
 	PeriodicStats int    `json:"periodic-stats"`
 	Verbose       bool   `json:"verbose"`
-	DropCheck     bool   `json:"drop-check"`
-	LatencyCheck  bool   `json:"latency-check"`
-	CSVStats      bool   `json:"csv-stats"`
-	FileHandle    *os.File
-	Logger        *log.Logger
+	out           *os.File
+	logger        *log.Logger
 }
 
 // APIConfig is config struct for API Server
@@ -96,9 +107,15 @@ func fillupDefaults(config *Config) {
 	if config.Influx.BatchSize == 0 {
 		config.Influx.BatchSize = DefaultIDBBatchSize
 	}
+	if config.Influx.HTTPTimeout == 0 {
+		config.Influx.HTTPTimeout = DefaultIDBTimeout
+	}
+	if config.Influx.AccumulatorFrequency == 0 {
+		config.Influx.AccumulatorFrequency = DefaultIDBAccumulatorFreq
+	}
 }
 
-// ParseJSONConfigFileList parses JSON encoded string of JTIMON Config files
+// ParseJSONConfigFileList parses file list config
 func ParseJSONConfigFileList(file string) (ConfigFileList, error) {
 	var configfilelist ConfigFileList
 
@@ -155,7 +172,7 @@ func ExploreConfig() (string, error) {
 			return string(b), nil
 		}
 	}
-	return "", errors.New("Something is very wrong - This should have not happened")
+	return "", errors.New("something is wrong, this should have not happened")
 }
 
 // IsVerboseLogging returns true if verbose logging is enabled, false otherwise
@@ -164,47 +181,93 @@ func IsVerboseLogging(jctx *JCtx) bool {
 }
 
 // GetConfigFiles to get the list of config files
-func GetConfigFiles(cfgFile *[]string, cfgFileList *string) error {
-	if len(*cfgFileList) != 0 {
-		configfilelist, err := NewJTIMONConfigFilelist(*cfgFileList)
+func GetConfigFiles(cfgFile *[]string, cfgFileList string) error {
+	if len(cfgFileList) != 0 {
+		configfilelist, err := NewJTIMONConfigFilelist(cfgFileList)
 		if err != nil {
-			return fmt.Errorf("Error %v in %v", err, cfgFileList)
+			return fmt.Errorf("%v: [%v]", err, cfgFileList)
 		}
 		n := len(configfilelist.Filenames)
 		if n == 0 {
-			return fmt.Errorf("File list doesn't have any files in %v", *cfgFileList)
+			return fmt.Errorf("%s doesn't have any files", cfgFileList)
 		}
 		*cfgFile = configfilelist.Filenames
 	} else {
 		n := len(*cfgFile)
 		if n == 0 {
-			return fmt.Errorf("Can not run without any config file")
+			return fmt.Errorf("can not run without any config file")
 		}
 	}
 	return nil
 }
 
-// ValidateConfigChange to check which config changes are allowed
-func ValidateConfigChange(jctx *JCtx, config Config) error {
-	runningCfg := jctx.config
-	if !reflect.DeepEqual(runningCfg, config) {
-		// Config change is now only for path, it can be extended.
-		if !reflect.DeepEqual(runningCfg.Paths, config.Paths) {
-			return nil
+// DecodePassword will decode the password if decoder util is present in the config
+func DecodePassword(jctx *JCtx, config Config) (string, error) {
+	// Default is the current passsword value
+	password := config.Password
+	if len(config.PasswordDecoder) > 0 {
+		// Run the decode util with the input file as argument
+		cmd := exec.Command(config.PasswordDecoder, jctx.file)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		outStr, errStr := string(stdout.Bytes()), string(stderr.Bytes())
+		if err != nil {
+			log.Fatalf("cmd.Run() failed with %s:%s\n", err, errStr)
+			return "", err
 		}
+		password = outStr
 	}
-	return fmt.Errorf("Config Change Validation")
+	return password, nil
 }
 
-// ConfigRead will read the config and init the services.
-// In case of config changes, it will update the  existing config
-func ConfigRead(jctx *JCtx, init bool) error {
+// HandleConfigChange to check which config changes are allowed
+func HandleConfigChange(jctx *JCtx, config Config, restart *bool) error {
+	// In the config get the decoded password as the running config will
+	// have the decoded password.
+	value, err := DecodePassword(jctx, config)
+	if err != nil {
+		return err
+	}
+	config.Password = value
+	// Compare the new config and the running config
+	if !reflect.DeepEqual(jctx.config, config) {
+		jLog(jctx, fmt.Sprintf("Processing config changes"))
+		// config changed
+		if !reflect.DeepEqual(jctx.config.Influx, config.Influx) {
+			return fmt.Errorf("HandleConfigChange : Influxdb config changes are not allowed")
+		}
+		// In case if there is a change only in Log. stop the log and start it again.
+		// No need to disturb the subscription.
+		if jctx.config.Log != config.Log {
+			if IsVerboseLogging(jctx) {
+				jLog(jctx, fmt.Sprintf("Log config has been updated"))
+			}
+			logStop(jctx)
+			jctx.config.Log = config.Log
+			logInit(jctx)
+		}
+		// Check if any change in config post the log updation changes
+		if !reflect.DeepEqual(jctx.config, config) {
+			jctx.config = config
+			if restart != nil {
+				jLog(jctx, fmt.Sprintf("Restarting worker process to spawn new device connection"))
+				*restart = true
+			}
+		}
+	}
+	return nil
+}
+
+// ConfigRead will read the config and init the services. In case of config changes, it will update the existing config
+func ConfigRead(jctx *JCtx, init bool, restart *bool) error {
 	var err error
 
 	config, err := NewJTIMONConfig(jctx.file)
 	if err != nil {
-		fmt.Printf("\nConfig parsing error for %s: %v\n", jctx.file, err)
-		return fmt.Errorf("config parsing (json Unmarshal) error for %s[%d]: %v", jctx.file, jctx.index, err)
+		log.Printf("config parsing error for %s: %v", jctx.file, err)
+		return fmt.Errorf("config parsing (json unmarshal) error for %s: %v", jctx.file, err)
 	}
 
 	if init {
@@ -212,37 +275,28 @@ func ConfigRead(jctx *JCtx, init bool) error {
 		logInit(jctx)
 		b, err := json.MarshalIndent(jctx.config, "", "    ")
 		if err != nil {
-			return fmt.Errorf("Config parsing error (json Marshal) for %s[%d]: %v", jctx.file, jctx.index, err)
-		}
-		jLog(jctx, fmt.Sprintf("\nRunning config of JTIMON:\n %s\n", string(b)))
-
-		if init {
-			jctx.pause.subch = make(chan struct{})
-
-			go periodicStats(jctx)
-			influxInit(jctx)
-			dropInit(jctx)
-			go apiInit(jctx)
+			return fmt.Errorf("config parsing error (json marshal) for %s: %v", jctx.file, err)
 		}
 
-		if *grpcHeaders {
-			pmap := make(map[string]interface{})
-			for i := range jctx.config.Paths {
-				pmap["path"] = jctx.config.Paths[i].Path
-				pmap["reporting-rate"] = float64(jctx.config.Paths[i].Freq)
-				addGRPCHeader(jctx, pmap)
-			}
+		jLog(jctx, fmt.Sprintf("Running config of JTIMON:\n %s", string(b)))
+		// Decode the password if the config has provided the decode util
+		value, err := DecodePassword(jctx, config)
+		if err != nil {
+			return err
 		}
+		jctx.config.Password = value
+		// subscription channel (subch) is used to let go routine receiving telemetry
+		// data know about certain events like sighup.
+		jctx.control = make(chan os.Signal)
+
+		go periodicStats(jctx)
+		influxInit(jctx)
 	} else {
-		err := ValidateConfigChange(jctx, config)
-		if err == nil {
-			jctx.config.Paths = config.Paths
-			jLog(jctx, fmt.Sprintf("Config has been updated\n"))
-		} else {
-			return fmt.Errorf("No change in subscription path, ignoring config changes")
+		err := HandleConfigChange(jctx, config, restart)
+		if err != nil {
+			return err
 		}
 	}
-
 	return nil
 }
 
@@ -254,54 +308,4 @@ func StringInSlice(a string, list []string) bool {
 		}
 	}
 	return false
-}
-
-// HandleConfigChanges will take care of SIGHUP handling for the main thread
-func HandleConfigChanges(cfgFileList *string, wMap map[string]*workerCtx,
-	wg *sync.WaitGroup, numServers *int) {
-	// Config was config list.
-	// On Sighup Need to do the following thins
-	// 		1. Add Worker threads if needed
-	//		2. Delete Worker threads if not in the list.
-	// 		3. Modify worker Config by issuing SIGHUP to the worker channel.
-	configfilelist, err := NewJTIMONConfigFilelist(*cfgFileList)
-	if err != nil {
-		fmt.Printf("Error in parsing the new config file, Continuing with older config")
-		return
-	}
-
-	s := syscall.SIGHUP
-
-	// Handle New Insertions and Changes
-	for _, file := range configfilelist.Filenames {
-		if wCtx, ok := wMap[file]; ok {
-			// Signal to the worker if they are running.
-			fmt.Printf("Sending SIGHUP to %v\n", file)
-			wCtx.signalch <- s
-		} else {
-			wg.Add(1)
-			*numServers++
-			fmt.Printf("Adding a new device to %v\n", file)
-			signalch, err := worker(file, *numServers, wg)
-			if err != nil {
-				wg.Done()
-			} else {
-				wMap[file] = &workerCtx{
-					signalch: signalch,
-					err:      err,
-				}
-			}
-		}
-	}
-
-	// Handle deletions
-	for wCtxFileKey, wCtx := range wMap {
-		if StringInSlice(wCtxFileKey, configfilelist.Filenames) == false {
-			// Kill the worker thread and remove it from the map
-			fmt.Printf("Deleting an entry to %v\n", wCtxFileKey)
-			wCtx.signalch <- os.Interrupt
-			delete(wMap, wCtxFileKey)
-		}
-	}
-	return
 }
